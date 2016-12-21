@@ -1,0 +1,62 @@
+#!/usr/bin/env ruby
+
+require_relative '../lib/helpers'
+require_relative '../lib/optimisers/location_optimiser'
+require_relative '../lib/datastore/instance_set'
+require_relative '../lib/predictors/svm'
+require_relative '../lib/geometric_helpers'
+
+# Read command-line options to an options object
+options = ParamReader.parse do |opts, params|
+  opts.on('--trajectory FILE', String, '[REQUIRED] Trajectory file for input') { |f| params.trajectory = f }
+  opts.on('--comparison FILE', String, '[REQUIRED] Output from location_predictor for the target') { |f| params.comparison = f }
+  opts.on('--kmax NUM', Integer, '[REQUIRED] Number of SA iterations') { |f| params.kmax = f }
+  opts.on('--output FILE', String, 'Save output to a file') { |f| params.output = f }
+end
+
+# Find the target values
+comparison = YAML.load_file(options.comparison)
+target = comparison[:results][:avg_location_area_visits]
+d_min = comparison[:params][:d_min]
+t_max = comparison[:params][:t_max]
+#$lock_dbscan = false
+
+# Let's go
+trajectory = YAML.load_file(options.trajectory)
+
+# Set the starting point and increments
+start_state = {alpha: 0.05, beta: 36, npoints: 5, tmax: t_max, eps: 15, minpts: 0}
+increments = {
+    eps: 5,
+    minpts: 1,
+    npoints: 2,
+    alpha: 0.2,
+    beta: 2,
+    tmax: 10,
+}
+
+# Define a lambda to verify a state as being valid
+parameter_validator = lambda do |state|
+  (state[:eps].nil? or state[:eps] > 0) and
+      (state[:minpts].nil? or state[:minpts] >= 0) and
+      (state[:npoints].nil? or state[:npoints] > 1) and
+      (state[:alpha].nil? or state[:alpha] >= 0) and
+      (state[:beta].nil? or (state[:beta] > 1 and state[:beta] > state[:npoints])) and
+      (state[:tmax] == t_max)
+end
+
+# Define a lambda to assign a set of locations a score (0 is best)
+outer_evaluator = lambda do |locations|
+  log_info "Preselect locations: #{locations.length}"
+  locations.select! { |l| l[:elements].select { |v| (v[:time].duration / 60.0)> d_min }.any? }
+  avg_loc_size = locations.any? ? locations.map { |l| GeometricHelpers.location_area(l[:elements]) }.mean : 0.0
+  [(avg_loc_size - target).abs, {avg_size: avg_loc_size, locations: locations.length}]
+end
+
+# Perform optimisation
+optimiser = Optimisers::LocationOptimiser.new(options.kmax, 'GVE', 'DBSCAN', trajectory, increments, parameter_validator, outer_evaluator, start_state)
+search = optimiser.search
+
+best_index = search.map { |i| i[:cost] }.index_of_min
+results = {params: options.marshal_dump, search: search, result: search[best_index]}
+File.write(options.output, "#{YAML.dump(results)} #{options.guard_string ? "\n#{options.guard_string}" : ''}")

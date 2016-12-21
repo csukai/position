@@ -1,0 +1,94 @@
+#!/usr/bin/env ruby
+
+require_relative '../lib/helpers'
+require_relative '../lib/geometric_helpers'
+require_relative '../lib/clusterers/thresholding'
+require_relative '../lib/clusterers/gve'
+require_relative '../lib/clusterers/dbscan'
+require_relative '../lib/datastore/instance_set'
+require_relative '../lib/predictors/svm'
+require_relative '../lib/predictors/hmm'
+
+##
+# Clusters and predicts over a raw trajectory
+##
+
+# Read command-line options to an options object
+options = ParamReader.parse do |opts, params|
+  opts.on('--trajectory FILE', String, '[REQUIRED] Trajectory file for input') { |f| params.trajectory = f }
+  opts.on('--output FILE', String, 'Save output to a file') { |f| params.output = f }
+  opts.on('--classifier STRING', String, '[REQUIRED] Name of classifier to use: [svm, hmm]') { |f| params.classifier = f }
+  opts.on('--clusterer STRING', String, '[REQUIRED] Name of clusterer to use: [thresholding, gve]') { |f| params.clusterer = f }
+  opts.on('--d_min NUM', Integer, '[REQUIRED] Minimum number of minutes to consider an interaction') { |f| params.d_min = f }
+  opts.on('--t_max NUM', Integer, '[REQUIRED] Maximum number of minutes between consecutive points (disable: 0)') { |f| params.t_max = f }
+  opts.on('--parameters STRING', String, 'Regex to Files containing a hash of GVE parameters') { |f| params.parameters = f }
+  opts.on('--param_file_count NUM', Integer, 'Expected number of parameter files (if using)') { |f| params.param_file_count = f }
+end
+
+trajectory = YAML.load_file(options.trajectory)
+
+# If we're given a parameter file, load the useful values
+if options.clusterer == 'gve' and options.parameters
+  files = Dir[options.parameters]
+  raise "Wrong number of param files (#{files.length} for #{options.param_file_count})" if options.param_file_count and options.param_file_count != files.length
+  loaded = files.map { |f| YAML.load_file(f)[:result] }.sort_by { |h| h[:cost] }.first
+  expected_size = loaded[:summary][:avg_size]
+  log_info "Size match expected: #{expected_size}"
+  loaded = loaded[:state]
+  raise("Tmax values don't match") unless options.t_max == loaded[:tmax]
+  npoints, alpha, beta, tmax, eps, minpts = loaded[:npoints], loaded[:alpha], loaded[:beta], options.t_max, loaded[:eps], loaded[:minpts]
+else
+  npoints, alpha, beta, tmax, eps, minpts, expected_size = 5, 0.05, 36, options.t_max == 0 ? nil : options.t_max, 15, 0, nil
+end
+
+# Cluster with a visit clusterer
+v_clusterer = options.clusterer == 'thresholding' ? Clusterers::Thresholding.new(trajectory, 50, options.d_min, tmax) : Clusterers::GVE.new(trajectory, npoints, alpha, beta, tmax)
+log_info "Visit Clustering: #{v_clusterer.visits.length} visits, Shortest: #{v_clusterer.visits.map { |v| v[:time].duration }.min.to_i}, Coverage: #{v_clusterer.visits.map { |v| v[:elements].length }.sum} of #{trajectory.length} points"
+
+# Cluster with DBSCAN
+l_clusterer = Clusterers::DBSCAN.new(v_clusterer.visits, eps, minpts)
+log_info "Location Clustering: #{l_clusterer.clusters.length} clusters, containing #{l_clusterer.clusters.map { |l| l[:elements].length }.sum} visits"
+
+# Convert into instances
+interactions = l_clusterer.clusters.map { |c| c[:elements].map { |v| v.merge!({cluster_id: c[:id]}) } }.flatten.sort_by { |v| v[:time].first }
+interactions.select! { |i| i[:time].duration / 60.0 > options.d_min } if options.d_min
+instances_array = interactions.each_cons(2).to_a.map do |current_interaction, next_interaction|
+  start_time = current_interaction[:time].first
+  {
+      dayofyear: start_time.yday,
+      dayofweek: start_time.wday,
+      hourofday: start_time.hour,
+      minuteofhour: start_time.min,
+      duration: current_interaction[:time].duration / 60,
+      cluster_id: current_interaction[:cluster_id],
+      class: next_interaction[:cluster_id]
+  }
+end
+instance_set = Datastore::InstanceSet.new(instances_array, {dayofyear: :numeric, dayofweek: :nominal, hourofday: :numeric, minuteofhour: :numeric, duration: :numeric, cluster_id: :nominal, class: :nominal})
+
+# Calculate some summary data
+valid_location_ids = interactions.map { |i| i[:cluster_id] }.uniq
+location_areas_points = l_clusterer.clusters.select { |l| valid_location_ids.include?(l[:id]) }.map { |l| GeometricHelpers.location_area(l[:elements].map { |v| v[:elements] }.flatten) }
+location_areas_visits = l_clusterer.clusters.select { |l| valid_location_ids.include?(l[:id]) }.map { |l| GeometricHelpers.location_area(l[:elements].flatten) }
+interaction_summary = {
+    visit_count: interactions.length,
+    location_count: valid_location_ids.length,
+    avg_location_area_points: location_areas_points.mean,
+    total_location_area_points: location_areas_points.sum,
+    avg_location_area_visits: location_areas_visits.mean,
+    expected_size: expected_size,
+    total_location_area_visits: location_areas_visits.sum,
+    total_time: interactions.map { |i| i[:time].duration }.sum
+}
+
+# Perform prediction
+case options.classifier
+  when 'svm'
+    classifier = Predictors::SVM.new(instance_set.weka_instances)
+  when 'hmm'
+    classifier = Predictors::HMM.new(instance_set.weka_instances, 4)
+end
+
+results = classifier.evaluation_statistics.merge(interaction_summary)
+File.write(options.output, "#{YAML.dump({params: options.marshal_dump, results: results})} #{options.guard_string ? "\n#{options.guard_string}" : ''}")
+

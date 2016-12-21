@@ -1,0 +1,34 @@
+#!/usr/bin/env ruby
+
+require_relative '../lib/helpers'
+require_relative '../lib/lookup_tools/wordnet_similarity'
+require_relative '../lib/clusterers/context_tree'
+
+##
+# Clusters a context tree from a summarised LU file
+##
+
+options = ParamReader.parse do |opts, params|
+  opts.on('--summarised FILE', String, '[REQUIRED] Summarised trajectory') { |f| params.summarised = f }
+  opts.on('--output FILE', String, '[REQUIRED] File to save output to') { |f| params.output = f }
+  opts.on('--lambda NUM', Float, '[REQUIRED] Lambda (semantic similarity weighting)') { |f| params.lambda = f }
+  opts.on('--prune ARRAY', Array, '[theta, xi] for pruning') { |a| params.pruning = a }
+end
+
+# Initialise files
+summarised = YAML.load_file(options.summarised)
+unpruned_tree = nil
+
+# Cluster tree
+tree = Clusterers::ContextTree.new(summarised, options.lambda)
+root = tree.cluster
+
+if options.pruning
+  root = tree.cluster
+  unpruned_tree = YAML.load(root.to_h.to_yaml)
+  root = tree.prune(*options.pruning.map { |i| Float(i) }, true)
+end
+
+# Output the tree
+output = {params: options.to_h, tree: root.to_h, unpruned_tree: unpruned_tree, summary: tree.summary}
+File.write(options.output, output.to_yaml + "\n#{options.guard_string}")

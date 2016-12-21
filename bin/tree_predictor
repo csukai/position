@@ -1,0 +1,47 @@
+#!/usr/bin/env ruby
+
+require_relative '../lib/helpers'
+# require_relative '../lib/lookup_tools/wordnet_similarity'
+require_relative '../lib/predictors/pct'
+require_relative '../lib/datastore/prediction_set'
+
+##
+# Converts a ContextTree into a PCT and evaluates it
+##
+
+# Read command-line options to an options object
+options = ParamReader.parse do |opts, params|
+  opts.on('--tree FILE', String, '[REQUIRED] Pre-clustered context tree file') { |f| params.tree = f }
+  opts.on('--summarised FILE', String, '[REQUIRED] The summarised file used to construct the tree') { |f| params.summarised = f }
+  opts.on('--output FILE', String, '[REQUIRED] Path to output file') { |f| params.output = f }
+  opts.on('--mode STRING', String, '[REQUIRED] Specifies prediction mode: [single-element, multi-element, single-context, multi-context]') { |f| params.mode = f }
+  opts.on('--model STRING', String, 'Specifies the classification model to use: [SVM, J48] (Default: SVM)') { |f| params.model = f.to_sym }
+  opts.on('--follow_threshold NUM', Float, '[REQUIRED] Set the threshold for following paths in the tree') { |f| params.follow_threshold = f }
+end
+
+case options.mode
+  when 'single-element'
+    leaf_only, multilabel = true, false
+  when 'multi-element'
+    leaf_only, multilabel = true, true
+  when 'single-context'
+    leaf_only, multilabel = false, false
+  when 'multi-context'
+    leaf_only, multilabel = false, true
+  else
+    raise "Undefined mode: #{options.mode}"
+end
+
+# Load data and generate instances
+summarised = YAML.load_file(options.summarised)
+instance_set = Datastore::PredictionSet.new(summarised)
+
+# Construct predictive model
+tree = Predictors::PCT.new(options.tree, instance_set, options.follow_threshold, options.model || :SVM)
+results = tree.evaluation_statistics(leaf_only, multilabel)
+
+# Output the statistics
+total = Float(results.values.sum)
+results.each { |k, v| results[k] = (Float(v) / total) * 100.0 }
+File.write(options.output, {params: options.marshal_dump, summary: {instances: total}.merge(results)}.to_yaml + "\n##{options.guard_string}")
+log_info "Correct: #{results[:correct]}, Context Correct: #{results[:context_correct]}"

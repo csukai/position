@@ -1,0 +1,44 @@
+#!/usr/bin/env ruby
+
+require 'yaml'
+require 'parallel'
+require 'bigdecimal'
+require 'time'
+require_relative '../../../lib/helpers'
+
+# Converts a trajectory in a CSV to YAML files
+# Assumes format: time,latitude,longitude,accuracy
+
+options = ParamReader.parse do |opts, params|
+  opts.on('--input_dir STRING', String, '[REQUIRED] Directory containing CSVs') { |f| params.input_dir = f }
+  opts.on('--output_dir STRING', String, '[REQUIRED] Output directory') { |f| params.output_dir = f }
+  opts.on('--output_prefix STRING', String, '[REQUIRED] Output file prefix') { |f| params.output_prefix = f }
+  opts.on('--omit_duplicates', 'Ignore repeated points recorded on the same time instance') { |f| params.omit_duplicates = f }
+  opts.on('--omit_truncated', 'Ignore points with truncated lat/lng values (for MDC)') { |f| params.omit_truncated = f }
+end
+
+Parallel.each(Dir["#{options.input_dir}/*.csv"], in_processes: 4) do |file|
+  log_info "Processing #{file}"
+  output_file = "#{options.output_dir}/#{options.output_prefix}_#{file.scan(/_(\d{4}|[a-z0-9]{2})\./).flatten.last}.yml"
+  trajectory, prev_time = [], Time.now
+  File.read(file).each_line do |l|
+    timestamp, latitude, longitude, accuracy = l.chomp.split(',')
+    point = {timestamp: Time.parse(timestamp), latitude: BigDecimal(latitude), longitude: BigDecimal(longitude), accuracy: accuracy.to_i}
+
+    if options.omit_duplicates and point[:timestamp] == prev_time
+      # Replace the previous point if this one is better and at the same time instance (if options.omit_duplicates is set)
+      if point[:accuracy] < trajectory.last[:accuracy]
+        trajectory.pop
+        trajectory << point
+      end
+    elsif options.omit_truncated and latitude[-9..-1] == "000000000"
+      next # Skip points with truncated lat/lngs if requested
+    else
+      trajectory << point
+    end
+
+    prev_time = point[:timestamp]
+  end
+  File.write(output_file, trajectory.to_yaml)
+end
+

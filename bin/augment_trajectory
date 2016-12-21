@@ -1,0 +1,42 @@
+#!/usr/bin/env ruby
+
+require_relative '../lib/helpers'
+require_relative '../lib/lookup_tools/overpass_api'
+
+##
+# Takes a trajectory and augments it with land usage information
+# Outputs 2 files: the augmented trajectory and a lookup file for the elements encountered
+##
+
+options = ParamReader.parse do |opts, params|
+  opts.on('--trajectory FILE', String, '[REQUIRED] Reads the point data from FILE') { |f| params.trajectory = f }
+  opts.on('--augmented_file FILE', String, '[REQUIRED] Location to save the corresponding land usage data') { |f| params.augmented_file = f }
+  opts.on('--lookup_file FILE', String, '[REQUIRED] Location to save the corresponding land usage data') { |f| params.lookup_file = f }
+end
+
+# Load the data file
+trajectory = YAML.load(File.read(options.trajectory))
+log_info "Trajectory loaded: #{trajectory.length} points"
+
+# Prepare to process
+master_lookup = Hash.new { |h, k| h[k] = {} }
+augmented_file = File.open(options.augmented_file, 'w')
+augmented_file.puts '---'
+
+# Augment the trajectory and write out as we go
+trajectory.each_with_index do |point, index|
+  log_info "Starting processing: point #{index} of #{trajectory.length}" if index % 100 == 0
+  lookup_data = LookupTools::OverpassAPI.new(point)
+  elements_encountered = lookup_data.full_details
+
+  elements_encountered.each { |k, _| master_lookup[k].merge!(elements_encountered[k]) }
+  augmented_file.puts([{latitude: point[:latitude], longitude: point[:longitude], timestamp: point[:timestamp],
+                      accuracy: point[:accuracy], data: lookup_data.summary_list}].to_yaml[4..-1])
+end
+
+# Finish off the augmented file
+augmented_file.puts(options.guard_string)
+augmented_file.close
+
+# Write out the lookup data
+File.write(options.lookup_file, master_lookup.to_yaml + "\n#{options.guard_string}")

@@ -1,0 +1,32 @@
+#!/usr/bin/env ruby
+
+require 'yaml'
+
+require_relative '../lib/helpers'
+require_relative '../lib/geometric_helpers'
+require_relative '../lib/map_draw'
+
+# Read command-line options to an options object
+options = ParamReader.parse do |opts, params|
+  opts.on('--trajectory FILE', String, 'Trajectory file for input') { |f| params.trajectory = f }
+  opts.on('--polygon FILE', String, 'File containing an array of polygons, or a single polygon') { |f| params.polygon = f }
+  opts.on('--output FILE', String, '[REQUIRED] PNG output file') { |f| params.output = f }
+  opts.on('--map FILE', String, '[REQUIRED] Plot points on top of an image file: ???-max_lat,max_lng,min_lat,min_lng.png') { |f| params.map = f }
+end
+
+# Load the trajectory into an array of points
+trajectory = YAML.load(File.read(options.trajectory)) if options.trajectory
+polygons = YAML.load(File.read(options.polygon)) if options.polygon
+polygons = [polygons] if polygons and polygons.flatten == polygons
+
+# Plot points to an image file
+coords = options.map.scan(/(-?\d+\.\d+)/).flatten
+raise 'Incorrect file name format for plot_visits' unless coords.length == 4
+md = MapDraw.new(coords.map { |i| Float(i) }, options.map, options.output)
+
+if options.polygon
+  location_formatted = polygons.map { |p| [{elements: p}] }.flatten
+  md.plot_polygons(location_formatted, trajectory || [], false, false)
+else
+  md.plot_points(trajectory)
+end

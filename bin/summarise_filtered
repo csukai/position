@@ -1,0 +1,56 @@
+#!/usr/bin/env ruby
+
+require_relative '../lib/helpers'
+require_relative '../lib/lookup_tools/landusage_lookup'
+
+##
+# Summarises a filtered trajectory
+##
+
+options = ParamReader.parse do |opts, params|
+  opts.on('--filtered FILE', String, '[REQUIRED] Filtered, augmented, trajectory') { |f| params.filtered = f }
+  opts.on('--lookup FILE', String, '[REQUIRED] Provide a land usage lookup file') { |i| params.lookup = i }
+  opts.on('--output FILE', String, '[REQUIRED] File to save output to') { |f| params.output = f }
+  opts.on('--t_max NUM', Integer, '[REQUIRED] Maximum number of minutes between consecutive points') { |i| params.t_max = i }
+  opts.on('--d_min NUM', Integer, '[REQUIRED] Minimum interaction duration (minutes)') { |i| params.d_min = i }
+  opts.on('--strict_check', 'Exit with an error unless the input file has a guard_string') { |b| params.strict_check = b }
+end
+
+raise "No guard string in input file and strict_check enabled" if options.strict_check and !`tail -n 2 #{options.filtered}`.include?("#RSUB_COMPLETE:")
+
+trajectory, lookup = YAML.load_file(options.filtered), LookupTools::LandusageLookup.new(options.lookup)
+overall, current, previous_time = hash_tree(1), {}, trajectory.first[:timestamp]
+
+# Iterate through the trajectory, detecting interactions
+log_info "Iteration beginning"
+trajectory.each do |point|
+
+  # Figure out what needs starting and ending
+  if options.t_max > 0 and ((point[:timestamp] - previous_time) / 60.0 > options.t_max)
+    to_end = current.keys
+    to_start = point[:data]
+  else
+    to_end = current.keys - point[:data]
+    to_start = point[:data] - current.keys
+  end
+
+  # Perform the actions
+  to_end.each { |key| overall[key] << (current[key]..previous_time); current.delete(key) }
+  to_start.each { |key| current[key] = point[:timestamp] }
+  previous_time = point[:timestamp]
+end
+
+# Wrap up the last open interactions
+current.keys.each { |key| overall[key] << (current[key]..previous_time) }
+
+# Fill in the element details
+log_info "Summarising interactions"
+summarised_data = overall.map do |key, times|
+  valid_times = times.select { |t| (t.duration / 60.0) > options.d_min }
+  next(nil) unless valid_times.any?
+  [key, lookup[key].merge(times: valid_times, key: key, latlngs: lookup.coordinates_for(key))]
+end.compact.to_h
+
+# Write out the summarised data
+log_info "Writing out data"
+File.write(options.output, "#{summarised_data.to_yaml}\n#{options.guard_string || ''}")

@@ -1,0 +1,43 @@
+#!/usr/bin/env ruby
+
+require_relative '../lib/helpers'
+require_relative '../lib/geometric_helpers'
+require_relative '../lib/datastore/prediction_set'
+require_relative '../lib/predictors/svm'
+require_relative '../lib/predictors/hmm'
+
+##
+# Uses a summarised LU file as a basis for prediction
+##
+
+options = ParamReader.parse do |opts, params|
+  opts.on('--summarised FILE', String, '[REQUIRED] Summarised trajectory') { |f| params.summarised = f }
+  opts.on('--output FILE', String, '[REQUIRED] File to save output to') { |f| params.output = f }
+  opts.on('--classifier STRING', String, '[REQUIRED] Name of classifier to use: [svm, hmm]') { |f| params.classifier = f }
+end
+
+# Load data and generate instances
+summarised = YAML.load_file(options.summarised)
+instance_set = Datastore::PredictionSet.new(summarised)
+
+# Calculate some summary data
+valid_location_ids = instance_set.interactions.map(&:cluster_id).uniq
+location_areas = valid_location_ids.map { |id| GeometricHelpers.location_area(summarised[id][:latlngs]) }
+interaction_summary = {
+    visit_count: instance_set.interactions.length,
+    location_count: valid_location_ids.length,
+    avg_location_area: location_areas.mean,
+    total_location_area: location_areas.sum,
+    total_time: instance_set.interactions.map { |i| i.time.last - i.time.first }.sum
+}
+
+# Perform prediction
+case options.classifier
+  when 'svm'
+    classifier = Predictors::SVM.new(instance_set.weka_instances)
+  when 'hmm'
+    classifier = Predictors::HMM.new(instance_set.weka_instances, 4)
+end
+
+results = classifier.evaluation_statistics.merge(interaction_summary)
+File.write(options.output, "#{YAML.dump({params: options.marshal_dump, results: results})} #{options.guard_string ? "\n#{options.guard_string}" : ''}")

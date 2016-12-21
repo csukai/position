@@ -1,0 +1,94 @@
+#!/usr/bin/env ruby
+
+require_relative '../lib/helpers'
+require_relative '../lib/optimisers/location_optimiser'
+require_relative '../lib/datastore/instance_set'
+require_relative '../lib/predictors/svm'
+require_relative '../lib/geometric_helpers'
+
+# Read command-line options to an options object
+options = ParamReader.parse do |opts, params|
+  opts.on('--trajectory FILE', String, '[REQUIRED] Trajectory file for input') { |f| params.trajectory = f }
+  opts.on('--output FILE', String, 'Save output to a file') { |f| params.output = f }
+  opts.on('--kmax NUM', Integer, '[REQUIRED] Number of SA iterations') { |f| params.kmax = f }
+  opts.on('--ve STRING', String, '[REQUIRED] Extractor class to use (note caps): [GVE, Thresholding, STA]') { |f| params.ve = f }
+  opts.on('--maxpercent NUM', Integer, '[REQUIRED] percent of data to use') { |f| params.maxpercent = f }
+end
+
+# Set the starting point and increments
+increments = {
+    eps: 5,
+    minpts: 1,
+    npoints: 2,
+    alpha: 0.2,
+    beta: 2,
+    tmax: 10,
+    n_buf: 1,
+    d_thres: 0.2,
+    radius: 2,
+    time: 5,
+}
+
+# Define a lambda to verify a state as being valid
+parameter_validator = lambda do |state|
+  (state[:eps].nil? or state[:eps] > 0) and
+      (state[:minpts].nil? or state[:minpts] >= 0) and
+      (state[:npoints].nil? or state[:npoints] > 1) and
+      (state[:alpha].nil? or state[:alpha] >= 0) and
+      (state[:beta].nil? or (state[:beta] > 1 and state[:beta] > state[:npoints])) and
+      (state[:tmax].nil? or state[:tmax] > 1) and
+      (state[:n_buf].nil? or state[:n_buf] > 1) and
+      (state[:d_thres].nil? or state[:d_thres] > 0) and
+      (state[:radius].nil? or state[:radius] > 1) and
+      (state[:time].nil? or state[:time] > 0)
+end
+
+# Define a lambda to assign a set of locations a score (0 is best)
+outer_evaluator = lambda do |locations|
+
+  # Extract ordered visits
+  locations.each { |l| l[:elements].each { |v| v[:location_id] = l[:id] } }
+  visit_hash = locations.map { |l| l[:elements] }.flatten.map { |v| [v[:id], v] }.to_h
+  visits = visit_hash.values.sort_by { |v| v[:time].first }
+
+  # Convert to instances
+  instances_array = visits.each_cons(2).to_a.map { |a| {location: a.first[:location_id], next_visit_id: a.last[:id], class: a.last[:location_id]} }
+  return [Float::INFINITY, {}] unless instances_array.any?
+  instance_set = Datastore::InstanceSet.new(instances_array, {location: :nominal, class: :nominal})
+  test, train = instance_set.test_train_split
+  return [Float::INFINITY, {}] unless instance_set.test_array.any? and instance_set.train_array.any?
+
+  # Train a predictor
+  svm = Predictors::SVM.new(train)
+  svm.train
+
+  # Evaluate using MAE
+  correct_predictions = 0
+  error = test.map.with_index do |instance, index|
+    predicted_location_id = instance_set.class_values[svm.classifyInstance(instance)]
+    predicted_location = locations[predicted_location_id]
+    actual_location_id = instance_set.test_array[index][:class]
+    correct_predictions += 1 if predicted_location_id == actual_location_id
+    actual_visit = visit_hash[instance_set.test_array[index][:next_visit_id]]
+    GeometricHelpers.distance_between(GeometricHelpers.location_centroid(predicted_location[:elements]), GeometricHelpers.location_centroid(actual_visit[:elements]))
+  end.map { |i| i / 1000.0 }.mean
+  [error, {avg_location_size: locations.map { |l| GeometricHelpers.location_area(l[:elements]) }.mean, avg_accuracy: correct_predictions / Float(test.length)}]
+end
+
+# Perform the optimisation
+trajectory = YAML.load_file(options.trajectory)
+trajectory = trajectory[0..(trajectory.length * (options.maxpercent * 100.0))]
+optimiser = Optimisers::LocationOptimiser.new(options.kmax, options.ve, 'DBSCAN', trajectory, increments, parameter_validator, outer_evaluator)
+search = optimiser.search
+
+# Output results if requested
+if options.output
+  costs = search.map { |i| i[:cost] }
+  raise "Costs contains NaN" if costs.select { |i| i.nan? }.any?
+  best_index = costs.index_of_min
+  raise "Best cost is Infinity" if search[best_index][:cost] == Float::INFINITY
+  results = {params: options.marshal_dump, search: search, result: {cost: search[best_index][:cost], parameters: search[best_index][:state]}}
+  File.write(options.output, "#{YAML.dump(results)} #{options.guard_string ? "\n#{options.guard_string}" : ''}")
+else
+  ap search
+end

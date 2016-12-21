@@ -1,0 +1,22 @@
+GEM
+  remote: https://rubygems.org/
+  specs:
+    awesome_print (1.7.0)
+    colorize (0.8.1)
+    haversine (0.3.1)
+    rmagick (2.16.0)
+    rmagick4j (0.4.0-java)
+
+PLATFORMS
+  java
+  ruby
+
+DEPENDENCIES
+  awesome_print
+  colorize
+  haversine
+  rmagick
+  rmagick4j
+
+BUNDLED WITH
+   1.10.6

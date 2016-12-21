@@ -1,0 +1,45 @@
+# Project Specific
+
+/config.yml
+
+######################
+# General
+######################
+
+# IntelliJ Files
+.idea
+/*.iml
+
+# Netbeans
+nbproject
+manifest.mf
+
+# Finder/Explorer Configs
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Bundler
+.bundle
+
+# Rails
+config/database.yml
+*.sqlite3
+
+# Java
+*.class
+
+# Ruby
+/*.gem
+
+# Python
+*.pyc
+
+# General Project
+cache/*
+tmp/*
+*.log

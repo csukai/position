@@ -1,0 +1,79 @@
+#!/usr/bin/env ruby
+
+require_relative '../lib/helpers'
+require_relative '../lib/optimisers/location_optimiser'
+require_relative '../lib/geometric_helpers'
+
+# Read command-line options to an options object
+options = ParamReader.parse do |opts, params|
+  opts.on('--trajectory FILE', String, '[REQUIRED] Trajectory file for input') { |f| params.trajectory = f }
+  opts.on('--output FILE', String, 'Save output to a file') { |f| params.output = f }
+  opts.on('--kmax NUM', Integer, '[REQUIRED] Number of SA iterations') { |f| params.kmax = f }
+  opts.on('--ve STRING', String, '[REQUIRED] Extractor class to use (note caps): [GVE, Thresholding, STA]') { |f| params.ve = f }
+  opts.on('--ground_truth FILE', String, "[REQUIRED] Path to ground_truth yml") { |f| params.ground_truth = f }
+end
+
+# Load the ground truth
+gt_full = YAML.load(File.read(options.ground_truth))
+user_gt = gt_full[:users][options.trajectory.scan(/(War_[a-z0-9]+)/).flatten.first].map { |b| gt_full[:buildings][b] }
+raise "Incorrect number of ground truth buildings" unless user_gt.length == 5
+
+# Load the trajectory into an array of points
+trajectory = YAML.load(File.read(options.trajectory))
+
+# Remove any points not even close to the GT locations (with 50% overscan)
+bb = GeometricHelpers.location_bounding_box(user_gt.flatten, 0.5)
+trajectory.select! { |p| (bb[:min_lat]..bb[:max_lat]).include?(p[:latitude]) and (bb[:min_lng]..bb[:max_lng]).include?(p[:longitude]) }
+
+# Set the starting point and increments
+increments = {
+    eps: 5,
+    minpts: 1,
+    npoints: 2,
+    alpha: 0.2,
+    beta: 2,
+    tmax: 10,
+    n_buf: 1,
+    d_thres: 0.2,
+    radius: 2,
+    time: 5,
+}
+
+# Define a lambda to verify a state as being valid
+parameter_validator = lambda do |state|
+  (state[:eps].nil? or state[:eps] > 0) and
+      (state[:minpts].nil? or state[:minpts] >= 0) and
+      (state[:npoints].nil? or state[:npoints] > 1) and
+      (state[:alpha].nil? or state[:alpha] >= 0) and
+      (state[:beta].nil? or (state[:beta] > 1 and state[:beta] > state[:npoints])) and
+      (state[:tmax].nil? or state[:tmax] > 1) and
+      (state[:n_buf].nil? or state[:n_buf] > 1) and
+      (state[:d_thres].nil? or state[:d_thres] > 0) and
+      (state[:radius].nil? or state[:radius] > 1) and
+      (state[:time].nil? or state[:time] > 0)
+end
+
+# Define a lambda to assign a set of locations a score (0 is best)
+outer_evaluator = lambda do |locations|
+  dc_locations_and_scores = user_gt.map do |building|
+    results = locations.map do |l|
+      [l, GeometricHelpers.dice_overlap(l[:elements].map { |v| v[:elements] }.flatten, building)]
+    end.select { |l| !l.last.nan? }
+    results.any? ? results.max { |l| l.last } : nil
+  end
+  dc_scores = dc_locations_and_scores.any? ? dc_locations_and_scores.map(&:last) : []
+  [1.0 - (dc_scores.mean.nil? ? 0.0 : dc_scores.mean), dc_locations_and_scores.map(&:first)]
+end
+
+# Perform optimisation
+optimiser = Optimisers::LocationOptimiser.new(options.kmax, options.ve, 'DBSCAN', trajectory, increments, parameter_validator, outer_evaluator)
+search = optimiser.search
+
+if options.output
+  best_index = search.map { |i| i[:cost] }.index_of_min
+  best_locations = search[best_index][:summary].map { |l| GeometricHelpers.location_hull(l[:elements].map { |v| v[:elements] }.flatten) }
+  results = {params: options.marshal_dump, search: search.map { |i| [i[:cost], i[:state]] }, result: {cost: search[best_index][:cost], parameters: search[best_index][:state], locations: best_locations}}
+  File.write(options.output, "#{YAML.dump(results)} #{options.guard_string ? "\n#{options.guard_string}" : ''}")
+else
+  ap search
+end

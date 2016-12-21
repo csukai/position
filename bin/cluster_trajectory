@@ -1,0 +1,114 @@
+#!/usr/bin/env ruby
+
+require_relative '../lib/helpers'
+require_relative '../lib/geometric_helpers'
+
+require_relative '../lib/clusterers/gve'
+require_relative '../lib/clusterers/thresholding'
+require_relative '../lib/clusterers/sta'
+require_relative '../lib/clusterers/dbscan'
+
+# Read command-line options to an options object
+options = ParamReader.parse do |opts, params|
+  opts.on('--trajectory FILE', String, '[REQUIRED] Trajectory file for input') { |f| params.trajectory = f }
+  opts.on('--output FILE', String, 'Save output to a file') { |f| params.output = f }
+  opts.on('--plot_visits FILE', String, 'Plot identified visits on top of an image file: ???-max_lat,max_lng,min_lat,min_lng.png') { |f| params.plot_visits = f }
+
+  opts.on('--ve STRING', String, '[REQUIRED] Name of extractor to use: [gve, thresholding, sta]') { |f| params.ve = f }
+  opts.on('--vc STRING', String, 'Name of clusterer to use: [dbscan] (omit for none)') { |f| params.vc = f }
+  opts.on('--d_min NUM', Integer, 'Minimum duration of a visit to consider (default: none)') { |f| params.d_min = f }
+
+  # GVE
+  opts.on('--n_points NUM', Integer, '[GVE]') { |f| params.n_points = f }
+  opts.on('--alpha NUM', Float, '[GVE]') { |f| params.alpha = f }
+  opts.on('--beta NUM', Integer, '[GVE]') { |f| params.beta = f }
+
+  # Thresholding
+  opts.on('--radius NUM', Integer, '[Thresholding]') { |f| params.radius = f }
+  opts.on('--time NUM', Integer, '[Thresholding] ** MINUTES **') { |f| params.time = f }
+
+  # GVE & Thresholding
+  opts.on('--t_max NUM', Integer, '[GVE/Thresholding] Maximum number of ** MINUTES ** between consecutive points (default or 0: infinity)') { |f| params.t_max = f }
+
+  # STA Extractor
+  opts.on('--n_buf NUM', Integer, '[STA]') { |f| params.n_buf = f }
+  opts.on('--d_thres NUM', Float, '[STA]') { |f| params.d_thres = f }
+
+  # DBSCAN
+  opts.on('--eps NUM', Integer, '[DBSCAN]') { |f| params.eps = f }
+  opts.on('--minpts NUM', Integer, '[DBSCAN]') { |f| params.minpts = f }
+end
+
+# Validate parameters
+raise 'Invalid visit extracter' unless %w{thresholding gve sta}.include?(options.ve)
+raise 'Invalid visit clusterer' unless !options.vc or %w{dbscan}.include?(options.vc)
+raise 'GVE requires: [n_points, alpha, beta]' unless options.ve != 'gve' or ![:n_points, :alpha, :beta].map { |o| options[o] }.include?(nil)
+raise 'Thresholding requires: [radius, time]' unless options.ve != 'thresholding' or ![:radius, :time].map { |o| options[o] }.include?(nil)
+raise 'STA requires: [n_buf, d_thres]' unless options.ve != 'sta' or ![:n_buf, :d_thres].map { |o| options[o] }.include?(nil)
+raise 'DBSCAN requires: [eps, minpts]' unless options.vc != 'dbscan' or ![:eps, :minpts].map { |o| options[o] }.include?(nil)
+raise 'Plotting visits needs an output file as well' if options.plot_visits and options.output.nil?
+options.t_max = nil if options.t_max and options.t_max == 0
+
+# Load the trajectory into an array of points
+trajectory = YAML.load(File.read(options.trajectory))
+
+# Identify interactions
+case options.ve
+  when 'gve'
+    ve = Clusterers::GVE.new(trajectory, options.n_points, options.alpha, options.beta, options.t_max)
+  when 'thresholding'
+    ve = Clusterers::Thresholding.new(trajectory, options.radius, options.time, options.t_max)
+  when 'sta'
+    ve = Clusterers::STA.new(trajectory, options.n_buf, options.d_thres)
+  else
+    raise
+end
+
+visits = ve.visits
+visits.select! { |v| ((v[:time].last - v[:time].first) / 60.0) > options.d_min } if options.d_min
+
+# Calculate how much time the trajectory covers, ignoring missing periods
+running_total, last_start, last_time = 0, trajectory.first[:timestamp], trajectory.first[:timestamp]
+trajectory.each do |p|
+  if p[:timestamp] - last_time > 3600
+    running_total += (last_time - last_start)
+    last_start = p[:timestamp]
+  end
+  last_time = p[:timestamp]
+end
+
+# Add visit summaries
+summary = {coverage: Float(visits.map { |v| v[:elements] }.flatten.length) / trajectory.length,
+           span_hrs: (trajectory.last[:timestamp] - trajectory.first[:timestamp]) / (60.0 * 60.0),
+           data_hrs: running_total / 3600.0}
+visit_durations = visits.map { |v| v[:time].last - v[:time].first } # in seconds
+summary[:visits] = {count: visits.length, min: visit_durations.min, max: visit_durations.max, avg: visit_durations.average}
+
+# Cluster to find locations
+if options.vc
+  vc = Clusterers::DBSCAN.new(visits, options.eps, options.minpts)
+  summary[:locations] = {
+      count: vc.locations.length,
+      avg_area: vc.locations.map { |c| GeometricHelpers.location_area(c[:elements]) }.mean,
+      avg_point_area: vc.locations.map { |c| GeometricHelpers.location_area(c[:elements].map { |e| e[:elements] }.flatten) }.mean,
+      visits_per_location: vc.locations.map { |c| c[:elements].length }.mean,
+  }
+end
+
+# Plot visits to an image file, if requested
+if options.plot_visits
+  require_relative '../lib/map_draw'
+  coords = options.plot_visits.scan(/(-?\d+\.\d+)/).flatten
+  raise 'Incorrect file name format for plot_visits' unless coords.length == 4
+  md = MapDraw.new(coords.map { |i| Float(i) }, options.plot_visits, options.output.sub(/\.[a-z]+/, '.png'))
+  md.plot_visits(visits, trajectory)
+end
+
+# Output
+results = {params: options.marshal_dump, summary: summary}
+if options.output
+  File.write(options.output, "#{YAML.dump(results)} #{options.guard_string ? "\n#{options.guard_string}" : ''}")
+  log_info "Output file written to #{options.output}"
+else
+  ap results
+end

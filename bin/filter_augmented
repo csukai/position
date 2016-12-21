@@ -1,0 +1,36 @@
+#!/usr/bin/env ruby
+
+require_relative '../lib/helpers'
+require_relative '../lib/partial_reader'
+require_relative '../lib/filter'
+require_relative '../lib/lookup_tools/landusage_lookup'
+
+##
+# Filters an augmented trajectory
+##
+
+options = ParamReader.parse do |opts, params|
+  opts.on('--augmented FILE', String, '[REQUIRED] Augmented trajectory') { |f| params.augmented = f }
+  opts.on('--lookup FILE', String, '[REQUIRED] Provide a land usage lookup file') { |i| params.lookup = i }
+  opts.on('--output FILE', String, '[REQUIRED] File to save output to') { |f| params.output = f }
+
+  opts.on('--maxradius NUM', Integer, 'Only consider elements smaller than NUM metres') { |i| params.maxradius = i }
+  opts.on('--delta NUM', Integer, '[REQUIRED] Set the buffer delta, in minutes') { |i| params.delta = i }
+  opts.on('--n NUM', Integer, '[REQUIRED] Limit to n elements per point') { |i| params.n = i }
+end
+
+# Initialise all the files and file readers
+trajectory = PartialReader.new(options.augmented)
+lookup = LookupTools::LandusageLookup.new(options.lookup)
+output = File.open(options.output, 'w')
+output.puts '---'
+
+# Begin filtering
+log_info "Beginning filtering process"
+filter = Filter.new(trajectory, lookup, options.maxradius, options.delta, options.n)
+filter.process(output)
+log_info "Filtering completed"
+
+# Close up shop
+output.puts options.guard_string if options.guard_string
+output.close
